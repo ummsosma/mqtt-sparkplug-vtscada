@@ -1,13 +1,22 @@
 # Architecture
 
-Two services, one queue table. The whole design follows from a single rule:
+This system is made up of two main programs (called services) and one database table (the queue table), which sits between them.
 
-> **A sample is written to the database before anything else happens to it, and
-> it is marked `delivered` only after it has been read back out of the VTScada
-> historian. An MQTT publish returning `rc=0` proves nothing.**
+- The collector listens for readings from the PLC over MQTT, decodes them, and writes each one to the queue table as soon as it arrives.
+- The bridge takes waiting rows out of that table and delivers them to the VTScada historian.
+- The queue table (pipeline.samples in TimescaleDB) is where readings wait between the two. A row starts as pending and becomes delivered only after the bridge has confirmed the reading is really in the historian.
 
-Everything else — the standby state, the retry behaviour, the audit tables — is a
-consequence of taking that rule seriously.
+One rule drives the whole design:
+
+> A sample is written to the database before anything else happens to it, and it is marked delivered only after it has been read back out of the VTScada historian. An MQTT publish returning rc=0 proves nothing.
+
+Why the rule is written that way:
+
+- Store first. A reading that exists only in memory is lost the moment the process dies. Writing to the database immediately, before any decoding, forwarding or transformation, means the broker can simply re-send anything that never got stored.
+- Check the final destination. The bridge does not trust its own write. It commits the data to VTScada, reads the historian back to confirm the timestamp and value landed, and only then marks the row delivered.
+- rc=0 is not proof. In MQTT, a return code of 0 means the broker received the message. It says nothing about whether VTScada processed it, stored it, or will still have it after a crash.
+
+The only success signal that counts is the data sitting in the historian. Everything else in the system, including the standby state, the retry delays, and the audit tables, follows from taking that seriously.
 
 This document has three parts:
 
@@ -67,7 +76,7 @@ This document has three parts:
      └─────────────┘
 ```
 
-The readback edge is what makes the design work: it is the only thing that turns
+The readback from the VTScada historian is what makes the design work: it is the only thing that turns
 "we sent it" into "it is there".
 
 ## The modules, and what each one is for
@@ -84,26 +93,26 @@ The readback edge is what makes the design work: it is the only thing that turns
 
 The dependency arrows point one way only: collector → decoder → settings, and
 bridge → vtclient → settings. The collector never talks to VTScada; the bridge
-never decodes a PLC message. That is deliberate, and it is why either side can be
-restarted, replaced or debugged alone.
+never decodes a PLC message. This is intentional, and it is why either side can be
+restarted, replaced, or debugged alone.
 
 ---
 
 ## Why two services and not one
 
-An earlier iteration had the collector both persisting *and* delivering, and two
+An earlier iteration had the collector both persisting *and* delivering (Storing and Forwarding), and two
 different components writing `delivery_state`. That made "who marked this row
 delivered, and why?" unanswerable, and it meant a slow delivery path could stall
-the ingestion path.
+the ingestion path. This also makes it easier to debug and prevents race conditions.
 
-Now the split is by responsibility, with a clean seam:
+Now they are split by their responsibility:
 
-* the **collector** owns getting every sample into the queue exactly once, and
+* the **collector** handles getting every sample into the queue/database exactly once, and
   knows nothing about VTScada;
-* the **bridge** owns the queue → historian transition, and nothing else writes
+* the **bridge** handles the queue → historian transition, and nothing else writes
   `delivery_state`.
 
-They share no state except the database, so either can be restarted, scaled or
+They share no state except the database, so either can be restarted, scaled, or
 replaced independently. It also means the queue can be drained by something else
 entirely without touching the collector.
 
@@ -130,7 +139,7 @@ is built on that.
 The MQTT network thread puts `(topic, payload, message_id)` onto an in-process
 work queue and returns immediately. **No database work happens on the network
 thread** — a slow query there would delay acknowledgements and cause the broker
-to re-send messages already stored. A worker thread picks the tuple up.
+to re-send messages that have already been stored. The worker thread picks the tuple up.
 
 *Data at this hand-off:* the raw bytes and topic, untouched. Nothing has been
 interpreted yet.
@@ -139,11 +148,11 @@ interpreted yet.
 
 `decoder.decode(topic, payload)` is asked: *what does this message mean?*
 
-Which decoder runs is a setting (`PLC_DECODER`): `json` for JSON bodies with
+Which decoder runs is based on the setting (`PLC_DECODER`): `json` for JSON bodies with
 configurable field names, `topic_tag` for a bare value whose meaning is carried
 by the topic, `sparkplug` for an already-encoded payload, `auto` to try them in
 order, `mapping` for a declarative JSON mapping file. This example is
-`topic_tag`: the payload is a bare number and the topic is the only clue to what
+`topic_tag`: the payload is a bare number, and the topic is the only clue to what
 it is.
 
 The decoder returns a **`Sample`** — the pipeline's internal shape for one
@@ -164,19 +173,19 @@ Why each field exists:
   historian will record — the whole point of the pipeline. A message with no
   timestamp falls back to arrival time and is documented as such.
 * `seq` — the deduplication sequence number. If the PLC does not send one (this
-  one does not) it is derived from the timestamp, so a replayed message collapses
+  one does not), it is derived from the timestamp, so a replayed message collapses
   onto the existing row instead of becoming a second one.
 
-If the decoder cannot make sense of the message it raises `Undecodable`. The
+If the decoder cannot make sense of the message, it raises `Undecodable`. The
 collector writes the raw payload to `pipeline.quarantine` with the reason, and
-**acknowledges** it — re-delivering an undecodable message can never succeed, so
+**acknowledges** it; re-delivering an undecodable message can never succeed, so
 there is nothing to gain.
 
 ## Step 3 — the collector validates and stores (db.py)
 
-Before inserting, the collector checks the timestamp is plausible — not before
+Before inserting, the collector checks that the timestamp is plausible; not before
 `TS_MIN_YEAR` (2020), not more than `TS_MAX_FUTURE_SECONDS` in the future. A PLC
-with an unset clock is common, and a 1970 timestamp landing in the historian
+with an unset clock is common (or clock skew/drift), and a 1970 timestamp landing in the historian
 poisons every trend that reads it. An implausible timestamp is quarantined like
 an undecodable message.
 
@@ -194,7 +203,7 @@ and discarded. The duplicate was never stored, so it does not need to be
 delivered twice.
 
 *Data at this hand-off:* a `Sample` from the decoder → one row in the queue.
-The raw topic and payload are stored alongside for forensics — when a reading
+The raw topic and payload are stored alongside for forensics; when a reading
 looks wrong three weeks later, the original message is still there.
 
 ## Step 4 — the collector acknowledges
@@ -211,18 +220,18 @@ re-delivered when the collector reconnects. Input is never lost ahead of the
 database.
 
 **The collector's contract ends here.** It never talks to VTScada and never
-touches `delivery_state` again. One row in `pipeline.samples` is `pending`, and
+touches `delivery_state` again. One row in `pipeline.samples` is marked `pending`, and
 everything after this step belongs to the bridge.
 
-## Step 5 — the bridge fetches pending rows (bridge.py)
+## Step 5 — the bridge fetches any pending rows (bridge.py)
 
 The bridge's main loop queries the queue for pending rows of *configured* tags
 (`VTS_TAGS` decides what is published at all), grouped per tag, in fair
 interleaved order so a tag with a huge backlog cannot starve the others.
 
-*Data at this hand-off:* rows out of the database as `Pending` tuples —
+*Data at this hand-off:* rows out of the database as `Pending` tuples
 `(source timestamp, value, event_id, seq, tag)`. A tag in the queue but not in
-`VTS_TAGS` is excluded here, and an ALARM names it once a minute: otherwise those
+`VTS_TAGS` is excluded here, and an ALARM names it once a minute; otherwise those
 dead rows would sit at the head of every batch forever.
 
 Rows attempted within the last `BRIDGE_RETRY_DELAY_SEC` are skipped too, so a
@@ -236,7 +245,7 @@ The pending rows are packed into one Sparkplug B `NDATA` payload for the topic
 
 One counter-intuitive property of VTScada, established experimentally (see
 [vtscada-wire-contract.md](vtscada-wire-contract.md)): the payload is **not** a
-list of different metrics. It is the *same metric name repeated* — one element
+list of different metrics. It is the *same metric name repeated*; one element
 per sample, each carrying its own source timestamp and value. VTScada writes
 every element into its historian at its own timestamp in one go.
 
@@ -248,15 +257,15 @@ Two defensive quirks in the payload, each defeating a silent VTScada failure:
   first payload after a BIRTH is dropped. The probe is read back before real
   delivery starts.
 
-The bridge publishes with QoS 1 and records `mqtt_rc`, the payload size and the
-row set in the `pipeline.batches` audit table. But — the rule the whole design
-hangs on — **`rc=0` proves nothing about storage.** The batch is not done.
+The bridge publishes with QoS 1 and records `mqtt_rc`, the payload size, and the
+row set in the `pipeline.batches` audit table. But the rule the whole design
+hangs on: **`rc=0` proves nothing about storage.** The batch is not done.
 
 ## Step 7 — the bridge reads the historian back (vtclient.py)
 
 `vtclient.history(tag, t_lo, t_hi)` sends a REST request to VTScada: `SQLQuery`
 on the `History` table for the tag's column over the batch's time window,
-following pagination. It returns `[(timestamp, value), ...]` — what the historian
+following pagination. It returns `[(timestamp, value), ...]` what the historian
 *actually* has.
 
 `bridge.confirm()` then matches every published event against that readback on
@@ -264,8 +273,8 @@ timestamp (within `TS_TOL`) and value (within `VALUE_TOL`). Everything that
 matches is confirmed; anything else stays `pending` and is retried.
 
 If REST itself is unreachable, the bridge never got to this step: before every
-cycle it probes REST and, while it is down, sits in **STANDBY** — publishing
-nothing, heart-logging the growing backlog every 60 s. Publishing into a void and
+cycle it probes REST and, while it is down, sits in **STANDBY** publishing
+nothing, heartbeat-logging the growing backlog every 60 s. Publishing into a void and
 then marking rows delivered is the one outcome the design exists to prevent.
 The collector is unaffected and keeps filling the queue; on recovery the bridge
 re-registers its tags and drains.
@@ -275,17 +284,17 @@ table → matched against the batch → a list of confirmed event_ids.
 
 ## Step 8 — the bridge marks delivered (db.py)
 
-In **one transaction** the bridge
+In **one transaction**, the bridge
 
 1. records the batch audit row,
-2. writes per-event rows to `pipeline.attempts` (`confirmed` / `unmatched` —
+2. writes per-event rows to `pipeline.attempts` (`confirmed` / `unmatched`
    what reconciliation later reads),
 3. flips confirmed rows to `delivery_state='delivered'`,
 4. advances the progress cursor.
 
 One transaction, because the cursor can never be allowed to claim progress past a
-row that was not confirmed. (Nothing in the pipeline *reads* the cursor —
-`delivery_state` drives delivery — it is a progress record, not a mechanism.)
+row that was not confirmed. (Nothing in the pipeline *reads* the cursor;
+`delivery_state` drives delivery; it is a progress record, not a mechanism.)
 
 At this point the sample has provably landed: it is in the historian at its
 source timestamp, and the row in the queue says so. `pipeline status` shows the
@@ -324,7 +333,7 @@ pipeline.samples (
 `UNIQUE (device_id, seq, tag)` is the idempotency key. A PLC replaying its buffer
 after a reconnect, or a broker redelivering a QoS 1 message, produces a duplicate
 insert that is counted and discarded rather than queued twice. For a PLC that
-sends no sequence number the collector derives `seq` from the sample's own
+sends no sequence number, the collector derives `seq` from the sample's own
 timestamp, which makes the key mean "this device, this tag, this instant" — the
 right deduplication semantic for a device that only reports `(tag, value, time)`.
 
@@ -367,12 +376,12 @@ never pending ones.
 | DB work never runs on the MQTT network thread | A slow query blocks the socket loop, delays acks, and makes the broker retransmit messages we already have |
 | `delivery_state` is written by exactly one component | Unanswerable "who delivered this?" and two components fighting over one row |
 | A batch is confirmed by readback, never by publish rc | Rows marked delivered that are not in the historian |
-| The delivered marking and the progress cursor advance in one transaction | A cursor that claims progress past rows that were never confirmed. (Nothing reads the cursor — `delivery_state` drives delivery — so this is about the record being truthful, not about behaviour) |
+| The delivered marking and the progress cursor advance in one transaction | A cursor that claims progress past rows that were never confirmed. (Nothing reads the cursor; `delivery_state` drives delivery; so this is about the record being truthful, not about behaviour) |
 | A row already attempted is not re-attempted for `BRIDGE_RETRY_DELAY_SEC` | "VTScada answers REST but is not storing" becoming a hot loop that hammers the historian and the broker |
 | The stall alarm keys off the last **confirmed** event, not the last attempted batch | The alarm staying silent through the one failure it exists to catch, because attempting a batch counts as progress |
 | Nothing is published while REST is unreachable | Publishing into the void, then marking it delivered |
-| A BIRTH is re-sent on recovery, with the same `bdSeq` | VTScada restarting during an outage forgets the metric list and ignores every following message. The `bdSeq` is deliberately not incremented, because the NDEATH will registered at connect carries that value |
-| `bdSeq` is persisted and incremented across restarts | A BIRTH the host considers stale, after which every message is ignored — presenting as "tags exist but never update" |
+| A BIRTH is re-sent on recovery, with the same `bdSeq` | VTScada restarting during an outage forgets the metric list and ignores every following message. The `bdSeq` is deliberately not incremented, because the NDEATH will be registered at connect and carries that value |
+| `bdSeq` is persisted and incremented across restarts | A BIRTH the host considers stale, after which every message is ignored; presenting as "tags exist but never update" |
 | One trailing duplicate element per tag group | VTScada silently drops a trailing Boolean `false` |
 | A warm-up probe before real delivery | The first payload after the BIRTH that creates the tags is dropped |
 | Queued tags not in `VTS_TAGS` are excluded from the batch query | Dead rows sitting at the head of every batch, starving real data forever |
@@ -396,9 +405,9 @@ authoritative retry state is `delivery_state='pending'` in the database.
 ## Failure behaviour
 
 **VTScada unreachable.** The bridge probes REST before every cycle. While it is
-down the bridge enters STANDBY, logs a heartbeat with the growing backlog every
+down, the bridge enters STANDBY, logs a heartbeat with the growing backlog every
 60 s, and publishes nothing. The collector is unaffected and keeps filling the
-queue. On recovery the bridge re-registers its tags and drains.
+queue. On recovery, the bridge re-registers its tags and drains.
 
 **The backlog under live load never reaches exactly zero**, because samples are
 always inside the publish → confirm window. That is why the store-and-forward test
@@ -417,7 +426,7 @@ checking for duplicate timestamps in the historian window.
 * **No web UI, no API.** The tools and SQL are the interface. Adding a service to
   serve a status page is a bigger liability than it is worth at this size.
 * **No hypertable.** `pipeline.samples` is a plain table. At one sample per second
-  per tag the volume is trivial, and a hypertable would force the partition column
+  per tag, the volume is trivial, and a hypertable would force the partition column
   into the primary key and complicate `ON CONFLICT`. If you ever need it, the
   column to partition on is `received_ts`.
 * **No message-schema registry.** The decoder is configuration; see
