@@ -1,0 +1,66 @@
+#!/bin/bash
+# Allow the tailnet (and Docker networks) to reach devices on the PLC cable.
+#
+# Install as /etc/NetworkManager/dispatcher.d/90-allow-plc-subnet
+#   cp deploy/90-allow-plc-subnet /etc/NetworkManager/dispatcher.d/
+#   chmod 755 /etc/NetworkManager/dispatcher.d/90-allow-plc-subnet
+#   chown root:root /etc/NetworkManager/dispatcher.d/90-allow-plc-subnet
+# NetworkManager refuses to run a dispatcher script that is not root-owned and
+# not writable by anyone else.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS
+#
+# `nmcli connection modify <conn> ipv4.method shared` is what gives a PLC on a
+# bare Ethernet cable an address, but it also installs a firewall table:
+#
+#   table ip nm-shared-<iface> {
+#     chain filter_forward {
+#       type filter hook forward priority filter; policy accept;
+#       ip daddr 10.42.0.0/24 oifname "<iface>" ct state { established, related } accept
+#       ip saddr 10.42.0.0/24 iifname "<iface>" accept
+#       iifname "<iface>" oifname "<iface>" accept
+#       iifname "<iface>" reject
+#       oifname "<iface>" reject        <-- this one
+#     }
+#   }
+#
+# That last rule rejects anything being forwarded OUT to the shared interface,
+# with an ICMP port-unreachable. So traffic arriving from a Tailscale subnet
+# router is refused before it ever reaches the wire: the PLC answers a ping from
+# the Pi itself and looks unreachable from every other machine. Shared mode is
+# built for NAT'd clients going out, not for reaching hosts on the shared subnet.
+#
+# NetworkManager rebuilds that table on every activation, so the accept has to be
+# re-added each time. That is this script's entire job.
+# ---------------------------------------------------------------------------
+
+IFACE="${PLC_IFACE:-eth0}"
+# The tailnet (Tailscale's CGNAT range), and Docker's default bridge ranges so a
+# container can also reach the PLC if it ever needs to.
+CLIENTS="100.64.0.0/10, 172.16.0.0/12"
+
+[ "$1" = "$IFACE" ] || exit 0
+case "$2" in
+    up|dhcp4-change|reapply|connectivity-change) ;;
+    *) exit 0 ;;
+esac
+
+# NetworkManager may still be installing its own table; give it a moment.
+for _ in $(seq 1 10); do
+    nft list table ip "nm-shared-$IFACE" >/dev/null 2>&1 && break
+    sleep 0.5
+done
+
+# Nothing to do if this is not a shared-mode connection.
+nft list table ip "nm-shared-$IFACE" >/dev/null 2>&1 || exit 0
+
+# Idempotent: do nothing if the accept is already in place.
+if nft list chain ip "nm-shared-$IFACE" filter_forward 2>/dev/null | grep -q "100.64.0.0/10"; then
+    exit 0
+fi
+
+nft insert rule ip "nm-shared-$IFACE" filter_forward \
+    ip saddr { $CLIENTS } oifname "$IFACE" accept
+
+logger -t plc-subnet "allowed tailnet -> $IFACE: PLC subnet is now reachable remotely"

@@ -1,0 +1,14 @@
+# Keep line endings LF everywhere. Windows checkouts with core.autocrlf=true
+# otherwise produce CRLF scripts and archives, and a shebang ending in \r fails
+# on the Pi with "env: 'bash\r': No such file or directory".
+* text=auto eol=lf
+
+*.sh            text eol=lf
+deploy/pipeline text eol=lf
+*.py            text eol=lf
+*.md            text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.sql           text eol=lf
+*.proto         text eol=lf
+*.example       text eol=lf

@@ -1,0 +1,24 @@
+mqtt-sparkplug-vtscada
+Copyright 2026 Dallas Davis
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+--------------------------------------------------------------------------------
+Third-party components
+
+This product includes the Eclipse Sparkplug B protobuf schema
+(src/pipeline/sparkplug/sparkplug_b.proto and the generated
+sparkplug_b_pb2.py), developed at Cirrus Link Solutions and others and made
+available under the Eclipse Public License 2.0:
+https://www.eclipse.org/legal/epl-2.0/
+
+It is designed to run alongside container images that carry their own licences:
+
+  emqx/emqx-enterprise   Business Source License 1.1. A single node runs under
+                         the bundled Community licence; clustering or broader
+                         commercial use needs a licence from EMQX.
+  timescale/timescaledb  Timescale Licence and PostgreSQL Licence.
+  python:3.12-slim       Python Software Foundation Licence.
+
+These images are pulled at deploy time and are not redistributed by this
+repository.

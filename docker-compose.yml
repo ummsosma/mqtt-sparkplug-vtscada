@@ -1,0 +1,221 @@
+# The whole deployment: broker + database + the two pipeline services.
+#
+# This is what runs on the Pi. One command starts everything:
+#
+#     cp .env.example .env      # then edit; .env is gitignored
+#     docker compose up -d --build
+#
+# Docker Compose reads `.env` in this directory for the ${VAR:-default}
+# substitutions below, so every setting has a working default and this file
+# doubles as the configuration reference.
+#
+# Image versions are pinned deliberately. They match what the deployment
+# environment already runs, so a rebuild cannot silently change broker or
+# database behaviour underneath the pipeline.
+
+name: mqtt-sparkplug-vtscada
+
+# Shared by the collector and the bridge; they differ only in their command and
+# in what they need to reach.
+x-pipeline-env: &pipeline-env
+  LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+  MQTT_HOST: "${MQTT_HOST:-emqx}"
+  MQTT_PORT: "${MQTT_PORT:-1883}"
+  MQTT_USERNAME: "${MQTT_USERNAME:-}"
+  MQTT_PASSWORD: "${MQTT_PASSWORD:-}"
+  MQTT_CLIENT_PREFIX: "${MQTT_CLIENT_PREFIX:-spb-vts}"
+  MQTT_TLS: "${MQTT_TLS:-false}"
+  MQTT_SESSION_EXPIRY_SEC: "${MQTT_SESSION_EXPIRY_SEC:-604800}"
+  MQTT_CONNECT_WINDOW_SEC: "${MQTT_CONNECT_WINDOW_SEC:-300}"
+  # Where the bridge persists bdSeq; the bridge-state volume is mounted here.
+  STATE_DIR: "${STATE_DIR:-/var/lib/pipeline}"
+  DB_HOST: "${DB_HOST:-timescaledb}"
+  DB_PORT: "${DB_PORT:-5432}"
+  DB_USER: "${DB_USER:-emqx}"
+  DB_PASSWORD: "${DB_PASSWORD:-emqx}"
+  DB_NAME: "${DB_NAME:-emqx}"
+  DB_SCHEMA: "${DB_SCHEMA:-pipeline}"
+  DB_STATEMENT_TIMEOUT_MS: "${DB_STATEMENT_TIMEOUT_MS:-15000}"
+  # Days of delivered/audit history to keep; 0 = keep forever. Pending rows are
+  # never pruned. Applied by the bridge at startup and daily.
+  RETENTION_DAYS: "${RETENTION_DAYS:-90}"
+  COLLECTOR_TICK_SEC: "${COLLECTOR_TICK_SEC:-1.0}"
+  # --- PLC input
+  PLC_TOPIC: "${PLC_TOPIC:-plc/#}"
+  PLC_DECODER: "${PLC_DECODER:-auto}"
+  PLC_DEVICE_ID: "${PLC_DEVICE_ID:-plc1}"
+  PLC_JSON_TAG_FIELD: "${PLC_JSON_TAG_FIELD:-tag}"
+  PLC_JSON_VALUE_FIELD: "${PLC_JSON_VALUE_FIELD:-value}"
+  PLC_JSON_TS_FIELD: "${PLC_JSON_TS_FIELD:-ts}"
+  PLC_JSON_SEQ_FIELD: "${PLC_JSON_SEQ_FIELD:-seq}"
+  PLC_JSON_DEVICE_FIELD: "${PLC_JSON_DEVICE_FIELD:-device}"
+  # Path (inside the container) to a declarative payload-mapping JSON file.
+  # Point PLC_DECODER=mapping at it to understand a new PLC shape without code.
+  # ./plc-mapping is mounted read-only into the collector; put plc.json there
+  # and set PLC_MAPPING_FILE=/plc-mapping/plc.json.
+  PLC_MAPPING_FILE: "${PLC_MAPPING_FILE:-}"
+  PLC_TOPIC_TAG_LEVELS: "${PLC_TOPIC_TAG_LEVELS:-2}"
+  # Empty default: settings.py turns "" into {}; a JSON default here would be
+  # mangled by compose interpolation.
+  PLC_TAG_MAP: "${PLC_TAG_MAP:-}"
+  TS_MIN_YEAR: "${TS_MIN_YEAR:-2020}"
+  TS_MAX_FUTURE_SECONDS: "${TS_MAX_FUTURE_SECONDS:-300}"
+  # --- Sparkplug B out
+  VTS_GROUP: "${VTS_GROUP:-SFTest}"
+  VTS_EDGE: "${VTS_EDGE:-sf-pi}"
+  VTS_TAGS: '${VTS_TAGS:-{"AI01": "double", "DI01": "bool"}}'
+  # --- VTScada REST (the delivery oracle). VTScada is NOT in this stack: it runs
+  #     on the SCADA PC and is reached over the tailnet.
+  VTS_REST_URL: "${VTS_REST_URL:-http://host.docker.internal:443}"
+  VTS_REST_REALM: "${VTS_REST_REALM:-odbc}"
+  VTS_REST_USER: "${VTS_REST_USER:-admin}"
+  VTS_REST_PASSWORD: "${VTS_REST_PASSWORD:-}"
+  VTS_TAG_ROOT: '${VTS_TAG_ROOT:-MQTT Context\MQTT-SB\MQTT-DRIVER}'
+  VTS_REST_TIMEOUT_SEC: "${VTS_REST_TIMEOUT_SEC:-20}"
+  # --- delivery tuning
+  BRIDGE_BATCH: "${BRIDGE_BATCH:-50}"
+  BRIDGE_ENABLED: "${BRIDGE_ENABLED:-true}"
+  # readback (default, needs VTScada REST) | publish (no REST, fire-and-forget)
+  BRIDGE_CONFIRM_MODE: "${BRIDGE_CONFIRM_MODE:-readback}"
+  BRIDGE_SETTLE_SEC: "${BRIDGE_SETTLE_SEC:-3.0}"
+  BRIDGE_BIRTH_WAIT_SEC: "${BRIDGE_BIRTH_WAIT_SEC:-8.0}"
+  BRIDGE_WARMUP_PROBE: "${BRIDGE_WARMUP_PROBE:-false}"
+  BRIDGE_WARMUP_TIMEOUT_SEC: "${BRIDGE_WARMUP_TIMEOUT_SEC:-45.0}"
+  BRIDGE_POLL_SEC: "${BRIDGE_POLL_SEC:-2.0}"
+  BRIDGE_RETRY_DELAY_SEC: "${BRIDGE_RETRY_DELAY_SEC:-30.0}"
+  BRIDGE_HEARTBEAT_SEC: "${BRIDGE_HEARTBEAT_SEC:-30.0}"
+  BRIDGE_STALL_ALARM_SEC: "${BRIDGE_STALL_ALARM_SEC:-300.0}"
+  TS_TOL: "${TS_TOL:-0.002}"
+  VALUE_TOL: "${VALUE_TOL:-1e-9}"
+
+services:
+  # ------------------------------------------------------------------ broker
+  # Durable sessions are the point of this broker config: a collector that is down
+  # still receives everything the PLC published while it was away.
+  #
+  # Note WHICH value applies. The collector is an MQTT v5 client and sends its own
+  # session expiry in the CONNECT packet (MQTT_SESSION_EXPIRY_SEC, 7 days by
+  # default) -- that is the one the broker honours for it. The
+  # EMQX_MQTT__SESSION_EXPIRY_INTERVAL setting below applies to 3.1/3.1.1 clients,
+  # which have no way to ask for one. They are kept in step so the intent is
+  # obvious, but changing only the EMQX_ one will not change the collector's.
+  emqx:
+    image: emqx/emqx-enterprise:6.3.1
+    container_name: emqx
+    hostname: emqx
+    ports:
+      - "1883:1883"     # MQTT
+      - "18083:18083"   # dashboard: admin / EMQX_DASHBOARD__DEFAULT_PASSWORD
+    environment:
+      EMQX_DASHBOARD__DEFAULT_PASSWORD: "${EMQX_DASHBOARD_PASSWORD:-public1234}"
+      EMQX_MQTT__MAX_MQUEUE_LEN: "1000000"
+      EMQX_MQTT__SESSION_EXPIRY_INTERVAL: "604800"
+      EMQX_DURABLE_SESSIONS__ENABLE: "true"
+      EMQX_DURABLE_SESSIONS__MESSAGE_RETENTION_PERIOD: "7d"
+    volumes:
+      - emqx-data:/opt/emqx/data
+      - emqx-log:/opt/emqx/log
+    healthcheck:
+      # A plain TCP check on the MQTT listener. `emqx ctl status` is the
+      # documented check, but it goes through Erlang distribution and exceeds the
+      # healthcheck timeout inside the container, leaving EMQX reported as
+      # "starting" forever even while it is happily serving traffic.
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/1883'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- database
+  # The durable queue lives here, in schema DB_SCHEMA. The collector creates its
+  # own tables on startup, so there is nothing to initialise by hand.
+  timescaledb:
+    image: timescale/timescaledb:2.30.2-pg16
+    container_name: timescaledb
+    hostname: timescaledb
+    environment:
+      POSTGRES_USER: "${DB_USER:-emqx}"
+      POSTGRES_PASSWORD: "${DB_PASSWORD:-emqx}"
+      POSTGRES_DB: "${DB_NAME:-emqx}"
+    volumes:
+      - timescale-data:/var/lib/postgresql/data
+    # Intentionally NOT published to the host. Nothing outside this Compose
+    # network needs SQL access; the collector and bridge reach it as
+    # `timescaledb:5432`. Publishing 5432 put the queue on the network with a
+    # default password (audit F1). For occasional admin, use:
+    #     docker compose exec timescaledb psql -U "$DB_USER" -d "$DB_NAME"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-emqx} -d ${DB_NAME:-emqx}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  # --------------------------------------------------------------- collector
+  # MQTT in -> durable queue. Withholds the PUBACK until the row is committed,
+  # so a message is never acknowledged while it lives only in memory.
+  collector:
+    build: .
+    image: mqtt-sparkplug-vtscada:local
+    container_name: collector
+    command: ["python", "-m", "pipeline.collector"]
+    environment: *pipeline-env
+    # Read-only payload mapping; put plc.json in ./plc-mapping (optional).
+    volumes:
+      - ./plc-mapping:/plc-mapping:ro
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      emqx:
+        condition: service_started
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ bridge
+  # durable queue -> Sparkplug B -> VTScada, confirmed by reading the historian
+  # back. Nothing is marked delivered on the strength of an MQTT ack.
+  bridge:
+    build: .
+    image: mqtt-sparkplug-vtscada:local
+    container_name: bridge
+    command: ["python", "-m", "pipeline.bridge"]
+    environment: *pipeline-env
+    # Lets the container reach a VTScada running on the Docker host itself. When
+    # VTScada is on another machine -- the usual case, it runs on the SCADA PC
+    # reached over the tailnet -- VTS_REST_URL points at that address and this
+    # mapping is simply unused.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Persists bdSeq. Without it every restart looks like a stale BIRTH to
+      # VTScada and all data is ignored.
+      - bridge-state:/var/lib/pipeline
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      emqx:
+        condition: service_started
+      collector:
+        condition: service_started
+    restart: unless-stopped
+
+  # Stand-in for a real CLICK PLUS. Off by default:
+  #     docker compose --profile sim up -d simulator
+  #     docker compose --profile sim stop simulator
+  simulator:
+    build: .
+    image: mqtt-sparkplug-vtscada:local
+    container_name: simulator
+    profiles: ["sim"]
+    command: ["python", "tools/simulate_plc.py", "--duration", "0", "--rate", "1"]
+    environment: *pipeline-env
+    depends_on:
+      emqx:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  emqx-data:
+  emqx-log:
+  timescale-data:
+  bridge-state:

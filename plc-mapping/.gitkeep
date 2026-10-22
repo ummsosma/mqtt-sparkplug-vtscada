@@ -1,0 +1,5 @@
+# Keep the plc-mapping directory in git so `docker compose` has somewhere to
+# mount. Put a real mapping here (copy example.json -> plc.json) and set:
+#     PLC_DECODER=mapping
+#     PLC_MAPPING_FILE=/plc-mapping/plc.json
+# See docs/CONFIGURATION.md "Mapping a new payload shape".

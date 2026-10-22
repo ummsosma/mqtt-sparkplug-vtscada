@@ -1,0 +1,12 @@
+# Runtime dependencies.
+#
+# paho-mqtt is pinned to 2.x: this codebase uses the 2.x callback API
+# (CallbackAPIVersion.VERSION2) and manual acknowledgement, both of which
+# paho-mqtt 1.x does not have.
+paho-mqtt>=2.1,<3
+
+psycopg2-binary>=2.9,<3
+
+# The generated Sparkplug codec validates the protobuf runtime version at import
+# and requires >= the version stamped into sparkplug_b_pb2.py (7.35.1).
+protobuf>=7.35,<8

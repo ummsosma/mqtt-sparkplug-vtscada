@@ -1,0 +1,426 @@
+#!/usr/bin/env bash
+#
+# pipeline — the one command a technician needs after installation.
+#
+# Every subcommand is real: it does the work it says it does, fails with a
+# useful message, and never prints a secret. Run `pipeline help`.
+#
+# This file lives in <repo>/deploy/. It finds docker-compose.yml in the repo
+# root one level up (override with PIPELINE_DIR).
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PIPELINE_DIR="${PIPELINE_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+COMPOSE_FILE="$PIPELINE_DIR/docker-compose.yml"
+ENV_FILE="$PIPELINE_DIR/.env"
+SERVICE_NAME="mqtt-sparkplug-vtscada"
+UNIT_NAME="pipeline"
+
+# ---------------------------------------------------------------- small helpers
+say()  { printf '%s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+need_docker() {
+    command -v docker >/dev/null 2>&1 || die "docker is not installed or not on PATH."
+    docker compose version >/dev/null 2>&1 || die "the 'docker compose' plugin is not available."
+    [ -f "$COMPOSE_FILE" ] || die "docker-compose.yml not found at $COMPOSE_FILE (set PIPELINE_DIR)."
+}
+
+# Read a key from .env without exporting or printing it.
+env_get() {
+    [ -f "$ENV_FILE" ] || return 0
+    # tr -d '\r': a .env edited on Windows has CRLF, and a trailing \r turns
+    # "emqx" into "emqx\r" -> psql: role "emqx\r" does not exist.
+    sed -n "s/^$1=//p" "$ENV_FILE" | tr -d '\r' | head -n1
+}
+
+# Set or add one KEY=VALUE in .env (creates .env if missing). Never prints a
+# secret. Preserves every other line and comment.
+#
+# Rewrites via python3 rather than `sed -i`: a value can contain any character
+# (a password with `&`, `|` or `\` would be silently mangled or break sed), and
+# python3 is already required by the VTS_TAGS JSON validation below.
+env_set() {
+    local key="$1" value="$2"
+    touch "$ENV_FILE"
+    python3 - "$ENV_FILE" "$key" "$value" <<'PY'
+import sys
+path, key, value = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path, encoding="utf-8") as f:
+    lines = f.read().splitlines()
+out, found = [], False
+for line in lines:
+    if line.startswith(key + "="):
+        out.append(f"{key}={value}")
+        found = True
+    else:
+        out.append(line)
+if not found:
+    out.append(f"{key}={value}")
+with open(path, "w", encoding="utf-8") as f:
+    f.write("\n".join(out) + "\n")
+PY
+}
+
+# Prompts are plain-text; use this for a visible value (never a password).
+ask() { local p="$1" d="${2:-}" a; printf '%s%s: ' "$p" "${d:+ [$d]}" >&2; read -r a; printf '%s' "${a:-$d}"; }
+ask_secret() { local p="$1" a; printf '%s: ' "$p" >&2; read -rs a; printf '\n' >&2; printf '%s' "$a"; }
+
+# Print the schema name for the psql helper queries; default matches settings.py.
+db_schema() { local s; s="$(env_get DB_SCHEMA)"; printf '%s' "${s:-pipeline}"; }
+db_user()   { local u; u="$(env_get DB_USER)";   printf '%s' "${u:-emqx}"; }
+db_name()   { local n; n="$(env_get DB_NAME)";   printf '%s' "${n:-emqx}"; }
+
+# readback (default) | publish. Anything unset or unexpected is readback, which
+# matches the bridge's own default.
+confirm_mode() { local m; m="$(env_get BRIDGE_CONFIRM_MODE)"; printf '%s' "${m:-readback}"; }
+
+psql_query() {   # $1 = SQL
+    docker compose -f "$COMPOSE_FILE" exec -T timescaledb \
+        psql -U "$(db_user)" -d "$(db_name)" -tAc "$1" 2>/dev/null
+}
+
+# --------------------------------------------------------------- REST capability
+# Runs inside the bridge container so it uses the real VTS_REST_* settings.
+# Prints one word: ok | credentials-rejected | not-permitted | unreachable | unknown
+rest_capability() {
+    local out
+    out="$(docker compose -f "$COMPOSE_FILE" exec -T bridge python - <<'PY' 2>/dev/null
+from pipeline.vtclient import VTScadaClient
+state, detail = VTScadaClient().probe()
+print(state)
+PY
+)" || true
+    printf '%s' "${out:-unknown}"
+}
+
+# --------------------------------------------------------------------- commands
+cmd_status() {
+    need_docker
+    say "== containers =="
+    docker compose -f "$COMPOSE_FILE" ps
+    say
+    say "== queue =="
+    local pending delivered
+    pending="$(psql_query "SELECT count(*) FROM $(db_schema).samples WHERE delivery_state='pending';")"
+    delivered="$(psql_query "SELECT count(*) FROM $(db_schema).samples WHERE delivery_state='delivered';")"
+    say "pending:   ${pending:-?}   (waiting to be confirmed by the historian)"
+    say "delivered: ${delivered:-?}   (audit trail; already in the historian)"
+
+    say
+    say "== storage =="
+    local dbsz
+    dbsz="$(psql_query "SELECT pg_size_pretty(pg_database_size(current_database()));")"
+    say "database: ${dbsz:-?}"
+    local vpath="/var/lib/docker/volumes/${SERVICE_NAME}_timescale-data/_data"
+    if [ -d "$vpath" ]; then
+        local use avail pct
+        use="$(df -P "$vpath" | awk 'NR==2{print $5}')"
+        avail="$(df -Ph "$vpath" | awk 'NR==2{print $4}')"
+        say "queue volume: ${use} used, ${avail} free"
+        pct="${use%\%}"
+        if [ -n "$pct" ] && [ "$pct" -ge 90 ] 2>/dev/null; then
+            say "WARNING: the disk holding the queue is ${use} full. Lower RETENTION_DAYS"
+            say "         and restart, or add space. A full disk stops ingestion."
+        fi
+    fi
+
+    say
+    if [ "$(confirm_mode)" = "publish" ]; then
+        say "== delivery (publish mode — VTScada REST NOT used) =="
+        say "BRIDGE_CONFIRM_MODE=publish: rows are marked delivered as soon as the MQTT"
+        say "publish succeeds. REST is not contacted, so there is nothing to probe here"
+        say "and no readback proof that the historian stored the data. To verify delivery,"
+        say "look in VTScada, or set BRIDGE_CONFIRM_MODE=readback and provide REST access."
+    else
+        say "== delivery (VTScada REST) =="
+        local cap; cap="$(rest_capability)"
+        case "$cap" in
+            ok)                   say "ok — the historian is reachable; delivery can be confirmed." ;;
+            credentials-rejected) say "credentials-rejected — REST answered 401/403: the account or"
+                                  say "   password in VTS_REST_USER / VTS_REST_PASSWORD is wrong."
+                                  say "   Nothing is delivered while this is wrong; the queue is safe." ;;
+            unreachable)          say "unreachable — no answer from VTS_REST_URL: check the network"
+                                  say "   (LAN or VPN) and that the VTScada application is running." ;;
+            not-permitted)        say "not-permitted — REST refused without a credential error: REST may"
+                                  say "   not be enabled, or the site blocks it. See docs/INSTALL.md." ;;
+            *)                    say "unknown — could not query the bridge (is it running?)." ;;
+        esac
+    fi
+
+    say
+    say "== last bridge heartbeat =="
+    docker compose -f "$COMPOSE_FILE" logs --tail 3 bridge 2>/dev/null | sed 's/^/  /' || true
+}
+
+cmd_logs() {
+    need_docker
+    local follow=""
+    [ "${1:-}" = "-f" ] && { follow="-f"; shift; }
+    # shellcheck disable=SC2086
+    docker compose -f "$COMPOSE_FILE" logs $follow --tail 200 "${1:-collector}" "${2:-bridge}"
+}
+
+cmd_start()   { need_docker; docker compose -f "$COMPOSE_FILE" up -d; }
+cmd_stop()    { need_docker; say "Stopping (data is kept in the volumes)."; docker compose -f "$COMPOSE_FILE" --profile sim down; }
+cmd_restart() {
+    need_docker
+    say "Applying settings (.env) by recreating any changed service…"
+    # `up -d` recreates exactly the containers whose configuration changed. A
+    # plain `docker compose restart` REUSES the existing containers, so a .env
+    # edit would be silently ignored -- which is the one thing this command is
+    # for.
+    docker compose -f "$COMPOSE_FILE" up -d
+}
+
+cmd_test() {
+    need_docker
+    if [ "$(confirm_mode)" = "publish" ]; then
+        warn "BRIDGE_CONFIRM_MODE=publish: there is no REST readback to verify against."
+        say "This check reads rows back out of the VTScada historian over REST, which"
+        say "publish mode does not use. Verify delivery directly in VTScada, or switch to"
+        say "BRIDGE_CONFIRM_MODE=readback (with REST access) to use this check."
+        return 0
+    fi
+    say "Reading every delivered row back out of the historian (the honest check)…"
+    docker compose -f "$COMPOSE_FILE" exec -T bridge python tools/verify_history.py reconcile
+}
+
+cmd_backup() {
+    need_docker
+    local dest="${1:-$PIPELINE_DIR/backups/$(date -u +%Y%m%dT%H%M%SZ)}"
+    mkdir -p "$dest" || die "cannot create $dest"
+    chmod 700 "$dest"
+
+    say "Backing up the queue (schema $(db_schema))…"
+    docker compose -f "$COMPOSE_FILE" exec -T timescaledb \
+        pg_dump -U "$(db_user)" -d "$(db_name)" -n "$(db_schema)" \
+        > "$dest/queue.sql" || die "pg_dump failed"
+    [ -s "$dest/queue.sql" ] || die "pg_dump produced an empty file"
+
+    say "Saving the Sparkplug bdSeq counter…"
+    docker compose -f "$COMPOSE_FILE" run --rm --no-deps -T bridge \
+        sh -c 'cat /var/lib/pipeline/bdseq 2>/dev/null || echo ""' > "$dest/bdseq" || true
+
+    say "Archiving the broker data volume…"
+    docker compose -f "$COMPOSE_FILE" run --rm --no-deps -T \
+        -v "${SERVICE_NAME}_emqx-data:/data:ro" bridge \
+        sh -c 'tar -C /data -cf - .' > "$dest/emqx-data.tar" 2>/dev/null || true
+    # Judge the archive by whether it is readable, not by tar's exit code: a
+    # live volume can make tar return non-zero while still producing a valid
+    # archive, which used to print a false "could not archive" warning.
+    if [ -s "$dest/emqx-data.tar" ] && tar -tf "$dest/emqx-data.tar" >/dev/null 2>&1; then
+        say "  broker data archived ($(du -h "$dest/emqx-data.tar" | cut -f1))."
+    else
+        rm -f "$dest/emqx-data.tar"
+        warn "could not archive emqx-data (non-fatal; the queue is the critical part)"
+    fi
+
+    {
+        echo "created: $(date -u +%FT%TZ)"
+        echo "compose: $COMPOSE_FILE"
+        echo "schema:  $(db_schema)"
+        echo "pendingat: $(psql_query "SELECT count(*) FROM $(db_schema).samples WHERE delivery_state='pending';")"
+    } > "$dest/MANIFEST.txt"
+
+    chmod 600 "$dest"/* 2>/dev/null || true
+    say "Backup written to: $dest"
+    say "Verify it is readable:  head -5 '$dest/queue.sql'"
+    say "Restore with:           pipeline restore '$dest'"
+}
+
+cmd_restore() {
+    need_docker
+    local src="${1:-}"
+    [ -n "$src" ] || die "usage: pipeline restore <backup-dir>"
+    [ -f "$src/queue.sql" ] || die "no queue.sql in $src"
+    if docker compose -f "$COMPOSE_FILE" ps --status running --quiet 2>/dev/null | grep -q .; then
+        die "refusing to restore into a running stack. Run 'pipeline stop' first (data is kept)."
+    fi
+    say "Restoring the queue from $src …"
+    docker compose -f "$COMPOSE_FILE" up -d timescaledb
+    say "Waiting for the database…"; sleep 5
+    docker compose -f "$COMPOSE_FILE" exec -T timescaledb \
+        psql -U "$(db_user)" -d "$(db_name)" -c "DROP SCHEMA IF EXISTS $(db_schema) CASCADE;" \
+        || die "could not drop the old schema"
+    docker compose -f "$COMPOSE_FILE" exec -T timescaledb \
+        psql -U "$(db_user)" -d "$(db_name)" < "$src/queue.sql" || die "restore failed"
+    if [ -s "$src/bdseq" ]; then
+        docker compose -f "$COMPOSE_FILE" run --rm --no-deps -T bridge \
+            sh -c "cat > /var/lib/pipeline/bdseq" < "$src/bdseq" || warn "could not restore bdseq"
+    fi
+    local restored
+    restored="$(psql_query "SELECT count(*) FROM $(db_schema).samples WHERE delivery_state='pending';")"
+    say "Restored. pending rows now: ${restored:-?}"
+    say "Start the pipeline with: pipeline start"
+}
+
+cmd_update() {
+    need_docker
+    say "Updating the pipeline image and services (volumes are preserved)…"
+    if [ -d "$PIPELINE_DIR/.git" ]; then
+        git -C "$PIPELINE_DIR" pull --ff-only || die "git pull failed; resolve manually and re-run"
+    else
+        warn "not a git checkout — copy the new release into $PIPELINE_DIR, then re-run"
+    fi
+    docker compose -f "$COMPOSE_FILE" up -d --build || die "rebuild/restart failed"
+    say "Re-verifying delivery…"
+    cmd_test
+}
+
+cmd_uninstall() {
+    need_docker
+    say "This will stop and remove the containers and the built image."
+    say "The database volume, the queue and the broker data are KEPT unless you opt in."
+    printf 'Remove containers only? [y/N] '; read -r a; [ "$a" = y ] || { say "aborted."; exit 0; }
+    docker compose -f "$COMPOSE_FILE" --profile sim down
+    say "Left in place (delete by hand only if you mean to):"
+    say "  volume ${SERVICE_NAME}_timescale-data   (the queue / audit history)"
+    say "  volume ${SERVICE_NAME}_emqx-data        (broker data)"
+    say "  volume ${SERVICE_NAME}_bridge-state     (bdseq)"
+    say "  $ENV_FILE (your configuration and credentials)"
+    printf 'Also DELETE all data and configuration? [y/N] '; read -r b
+    if [ "$b" = y ]; then
+        printf 'Type DELETE to confirm: '; read -r c
+        [ "$c" = DELETE ] || die "confirmation did not match; nothing deleted"
+        docker compose -f "$COMPOSE_FILE" --profile sim down -v
+        rm -f "$ENV_FILE"
+        say "Containers, volumes and .env removed."
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        say "To stop auto-start:  sudo systemctl disable --now $UNIT_NAME"
+    fi
+}
+
+cmd_configure() {
+    need_docker
+    say "== Configure == (press Enter to keep the value in brackets)"
+    say "Only the settings most deployments change are shown. Secrets are hidden."
+    say
+
+    # -- delivery: how VTScada is reached / proved
+    local cur_confirm
+    cur_confirm="$(env_get BRIDGE_CONFIRM_MODE)"
+    cur_confirm="${cur_confirm:-readback}"
+    say "How should delivery be proved?"
+    say "  readback = VTScada REST required (confirmed by reading history back)"
+    say "  publish  = no REST, fire-and-forget (rows delivered on MQTT publish)"
+    local confirm
+    confirm="$(ask 'Confirm mode (readback|publish)' "$cur_confirm")"
+    case "$confirm" in
+        readback|publish) env_set BRIDGE_CONFIRM_MODE "$confirm" ;;
+        *) die "confirm mode must be 'readback' or 'publish' (got '$confirm')" ;;
+    esac
+    if [ "$confirm" = "readback" ]; then
+        local url cur
+        cur="$(env_get VTS_REST_URL)"; cur="${cur:-http://host.docker.internal:443}"
+        url="$(ask 'VTScada REST URL' "$cur")"
+        env_set VTS_REST_URL "$url"
+        local user
+        user="$(ask 'VTScada REST user' "$(env_get VTS_REST_USER)")"
+        env_set VTS_REST_USER "$user"
+        local pass
+        pass="$(ask_secret 'VTScada REST password (leave blank to keep the current one)')"
+        if [ -n "$pass" ]; then env_set VTS_REST_PASSWORD "$pass"; fi
+    fi
+    say
+
+    # -- PLC input
+    local plctopic cur_topic
+    cur_topic="$(env_get PLC_TOPIC)"; cur_topic="${cur_topic:-plc/#}"
+    plctopic="$(ask 'PLC topic to subscribe to' "$cur_topic")"
+    env_set PLC_TOPIC "$plctopic"
+    local decoder cur_dec; cur_dec="$(env_get PLC_DECODER)"; cur_dec="${cur_dec:-auto}"
+    decoder="$(ask 'How to read each message (auto|json|topic_tag|sparkplug|mapping)' "$cur_dec")"
+    case "$decoder" in
+        auto|json|topic_tag|sparkplug)
+            env_set PLC_DECODER "$decoder"
+            ;;
+        mapping)
+            # 'mapping' needs a second setting, or the collector cannot start.
+            env_set PLC_DECODER mapping
+            local mfile cur_m
+            cur_m="$(env_get PLC_MAPPING_FILE)"; cur_m="${cur_m:-/plc-mapping/plc.json}"
+            mfile="$(ask 'Mapping file path inside the container' "$cur_m")"
+            env_set PLC_MAPPING_FILE "$mfile"
+            say "  Put your mapping JSON in $PIPELINE_DIR/plc-mapping/ -- that folder is"
+            say "  mounted read-only at /plc-mapping, so the default path is the usual one."
+            ;;
+        *)
+            die "PLC decoder must be one of auto|json|topic_tag|sparkplug|mapping"
+            ;;
+    esac
+    local tags
+    tags="$(ask 'Tags and types JSON (e.g. {"AI01":"double"})' "$(env_get VTS_TAGS)")"
+    printf '%s' "$tags" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null \
+        || die "VTS_TAGS is not valid JSON"
+    env_set VTS_TAGS "$tags"
+    say
+
+    say "Configuration saved to $ENV_FILE"
+    say "Apply it by restarting the collector and bridge:"
+    say "  pipeline restart"
+    say "Or check that all settings are correct first:"
+    say "  pipeline status"
+}
+
+cmd_simulate() {
+    need_docker
+    case "${1:-start}" in
+        start)
+            say "Starting the PLC simulator (publishes sample AI01/DI01 data to plc/#)…"
+            docker compose -f "$COMPOSE_FILE" --profile sim up -d simulator
+            say "Watch it arrive:  $0 status   /   $0 logs -f collector"
+            ;;
+        stop)
+            say "Stopping the PLC simulator."
+            docker compose -f "$COMPOSE_FILE" --profile sim stop simulator
+            ;;
+        *)
+            die "usage: pipeline simulate [start|stop]"
+            ;;
+    esac
+}
+
+cmd_help() {
+    cat <<EOF
+pipeline — operate the MQTT → VTScada store-and-forward stack
+
+Usage: pipeline <command> [args]
+
+  status            one-screen health: containers, queue, VTScada reachability
+  logs [-f] [svc]   follow collector/bridge logs (default: both)
+  start             start the stack
+  stop              stop the stack (keeps all data)
+  restart           apply .env changes (recreates whatever changed)
+  test              read every delivered row back out of the historian
+  simulate [start]  run a fake PLC (sample data) so you can test with no hardware
+  configure         safely edit the important settings (.env) with validation
+  backup [dir]      dump the queue, bdseq and broker data to a safe directory
+  restore <dir>     restore a backup (stack must be stopped)
+  update            pull/rebuild and re-verify
+  uninstall         stop and remove containers (asks twice before deleting data)
+  help              this text
+
+Configuration is in $ENV_FILE — see docs/CONFIGURATION.md.
+Data lives in Docker volumes; 'stop' and 'uninstall' never delete it silently.
+EOF
+}
+
+case "${1:-help}" in
+    status)   shift; cmd_status "$@" ;;
+    logs)     shift; cmd_logs "$@" ;;
+    start)    shift; cmd_start "$@" ;;
+    stop)     shift; cmd_stop "$@" ;;
+    restart)  shift; cmd_restart "$@" ;;
+    test)     shift; cmd_test "$@" ;;
+    simulate|sim) shift; cmd_simulate "$@" ;;
+    configure) shift; cmd_configure "$@" ;;
+    backup)   shift; cmd_backup "$@" ;;
+    restore)  shift; cmd_restore "$@" ;;
+    update)   shift; cmd_update "$@" ;;
+    uninstall) shift; cmd_uninstall "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *) die "unknown command '${1}'. Run 'pipeline help'." ;;
+esac

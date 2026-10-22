@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "decoder": "json",
+  "tag_field": "tag",
+  "value_field": "value",
+  "ts_field": "ts",
+  "seq_field": "seq",
+  "device_field": "device",
+  "tags": {
+    "AI01": {
+      "to": "TankLevel",
+      "transform": { "scale": 0.1, "offset": 0.0 }
+    },
+    "AI02": {
+      "to": "TankTemp",
+      "transform": { "scale": 1.0 }
+    },
+    "DI01": {
+      "to": "PumpRunning",
+      "transform": { "map": { "1": true, "0": false, "ON": true, "OFF": false } }
+    }
+  },
+  "topics": {
+    "plc/1": { "tag": "DS1", "transform": { "scale": 1.0 } }
+  }
+}

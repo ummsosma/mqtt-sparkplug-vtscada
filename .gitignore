@@ -1,0 +1,19 @@
+# Secrets and local overrides -- never commit these.
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# Runtime state (the bridge's bdSeq counter, local logs)
+state/
+*.log
+
+# Local test run output
+tests/results/

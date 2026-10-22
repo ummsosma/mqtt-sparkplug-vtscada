@@ -1,0 +1,20 @@
+[Unit]
+Description=MQTT to VTScada store-and-forward pipeline
+Documentation=file:///opt/mqtt-sparkplug-vtscada/docs/INSTALL.md
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/mqtt-sparkplug-vtscada
+# `up -d` is idempotent: it starts what is missing and leaves the rest alone.
+ExecStart=/usr/bin/docker compose up -d
+# `down` keeps the named volumes, so the queue survives a stop/start cycle.
+ExecStop=/usr/bin/docker compose down
+TimeoutStartSec=300
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target
